@@ -1,0 +1,7 @@
+.idea
+temp
+tmp
+*.log
+aws-env
+bin/
+
