@@ -4,4 +4,7 @@ tmp
 *.log
 aws-env
 bin/
+.DS_Store
+*.zip
+
 

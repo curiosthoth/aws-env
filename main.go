@@ -8,14 +8,21 @@ import (
 	"os"
 )
 
-func runPipeMode(manager *internal.CachedSecretsManager, associativeArrayName string, silent bool) {
+func runPipeMode(manager *internal.CachedSecretsManager, associativeArrayName string, export bool, silent bool) {
 	if !silent {
 		_, _ = fmt.Fprintf(os.Stderr, "Warning: make sure to pipe the result into some other command instead of printing the vars to stdout\n")
+	}
+	if export && associativeArrayName != "" {
+		_, _ = fmt.Fprintf(os.Stderr, "Error: only one of -a or -e can be used at a time. Stopped.")
+		return
 	}
 
 	outputLineFormatter := "%s=%s\n"
 	if associativeArrayName != "" {
 		outputLineFormatter = associativeArrayName + "[%s]=%s\n"
+	}
+	if export {
+		outputLineFormatter = "export " + outputLineFormatter
 	}
 
 	// Iterate the lines from os.Stdin and SplitEnvString for each of them and print the result
@@ -72,6 +79,7 @@ func main() {
 	// Define a boolean flag with the name "p" (for Pipe Mode)
 	pipeMode := flag.Bool("p", false, "Run in Pipe Mode.")
 	associativeArrayName := flag.String("a", "", "Name of the associative array (Bash) to output, instead of the env=value format. Only valid when in Pipe Mode.")
+	export := flag.Bool("e", false, "Output export commands for the variables. Only valid when in Pipe Mode.")
 	silent := flag.Bool("s", false, "Silent mode. Do not print warnings or errors to stderr.")
 	// Parse the command-line flags
 	flag.Parse()
@@ -81,10 +89,13 @@ func main() {
 
 	// Check if the -p flag was provided
 	if *pipeMode {
-		runPipeMode(manager, *associativeArrayName, *silent) // Call the Pipe Mode function
+		runPipeMode(manager, *associativeArrayName, *export, *silent) // Call the Pipe Mode function
 	} else {
 		if *associativeArrayName != "" {
 			_, _ = fmt.Fprintf(os.Stderr, "Warning: -a flag is only valid in Pipe Mode. Ignoring the flag.\n")
+		}
+		if *export {
+			_, _ = fmt.Fprintf(os.Stderr, "Warning: -e flag is only valid in Pipe Mode. Ignoring the flag.\n")
 		}
 		runInitMode(manager, *silent) // Call the Init Mode function
 	}
