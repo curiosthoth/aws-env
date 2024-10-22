@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"github.com/curiosthoth/aws-env/internal"
 	"os"
+	"os/exec"
+	"syscall"
 )
 
 func runPipeMode(manager *internal.CachedSecretsManager, associativeArrayName string, export bool, silent bool) {
@@ -71,8 +73,39 @@ func runPipeMode(manager *internal.CachedSecretsManager, associativeArrayName st
 	}
 }
 
-func runInitMode(manager *internal.CachedSecretsManager, silent bool) {
-
+func runInitMode(manager *internal.CachedSecretsManager, args []string, silent bool) {
+	// Iterate the env vars and SplitEnvString for each of them and print the result
+	for _, envVarLing := range os.Environ() {
+		envVar, err := internal.SplitEnvString(envVarLing)
+		if err != nil {
+			if !silent {
+				_, _ = fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			}
+			continue
+		}
+		// Regular Env Var, skip
+		if envVar.SecretName == nil {
+			continue
+		}
+		// Otherwise fetch and set from SecretsManager
+		actualValue, found := manager.Get(*envVar.SecretName, envVar.JMESPath)
+		if found {
+			_ = os.Setenv(envVar.Name, actualValue)
+		} else {
+			jmesPathStr := ""
+			if envVar.JMESPath != nil {
+				jmesPathStr = *envVar.JMESPath
+			}
+			if !silent {
+				_, _ = fmt.Fprintf(os.Stderr, "Error: Secret %s (path=%s) not found\n", *envVar.SecretName, jmesPathStr)
+			}
+		}
+	}
+	path, err := exec.LookPath(args[0])
+	if err != nil {
+		panic(err)
+	}
+	_ = syscall.Exec(path, args[0:], os.Environ())
 }
 
 func main() {
@@ -97,6 +130,6 @@ func main() {
 		if *export {
 			_, _ = fmt.Fprintf(os.Stderr, "Warning: -e flag is only valid in Pipe Mode. Ignoring the flag.\n")
 		}
-		runInitMode(manager, *silent) // Call the Init Mode function
+		runInitMode(manager, flag.Args(), *silent) // Call the Init Mode function
 	}
 }
