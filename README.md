@@ -1,7 +1,8 @@
 AWS-Env
 ====
 
-A simple tool for substituting environment variables with values from AWS Secrets Manager.
+A simple tool for substituting environment variables with values from AWS Secrets Manager. Inspired by Remind101's [ssm-env](https://github.com/remind101/ssm-env).
+
 It checks the environment variables for values starting with `secretsmanager://<key>` and fetches the value from AWS
 Secrets Manager by `<key>`.
 
