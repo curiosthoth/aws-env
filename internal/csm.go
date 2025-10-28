@@ -31,53 +31,56 @@ func NewCachedSecretsManager() *CachedSecretsManager {
 
 // Get retrieves the secret value from AWS Secrets Manager
 // The JMESPath can be nil, in which case the raw value is returned.
-func (v *CachedSecretsManager) Get(secretName string, jmesPath *string) (string, bool) {
-	raw, found := v.getRaw(secretName)
+// Returns the value, a boolean indicating success, and an error message if applicable
+func (v *CachedSecretsManager) Get(secretName string, jmesPath *string) (string, bool, string) {
+	raw, found, errMsg := v.getRaw(secretName)
 	if found {
 		if jmesPath != nil {
 			return v.getByJmesPath(secretName, raw, *jmesPath)
 		} else {
-			return raw, true
+			return raw, true, ""
 		}
 	} else {
-		return "", false
+		return "", false, errMsg
 	}
 }
 
 // getRaw retrieves the secret value from AWS Secrets Manager and cache it locally as is
-func (v *CachedSecretsManager) getRaw(secretName string) (string, bool) {
+// Returns the value, a boolean indicating success, and an error message if applicable
+func (v *CachedSecretsManager) getRaw(secretName string) (string, bool, string) {
 	if r, found := v.rawCache[secretName]; found {
-		return r, true
+		return r, true, ""
 	}
 	input := &secretsmanager.GetSecretValueInput{
 		SecretId: &secretName,
 	}
 	result, err := v.client.GetSecretValue(context.TODO(), input)
 	if err != nil {
-		return "", false
+		return "", false, err.Error()
 	}
 	r := *result.SecretString
 	v.rawCache[secretName] = r
-	return r, true
+	return r, true, ""
 }
 
 // getByJmesPath retrieves the secret value from AWS Secrets Manager and cache it locally
-func (v *CachedSecretsManager) getByJmesPath(secretName string, raw string, jmesPath string) (string, bool) {
+// Returns the value, a boolean indicating success, and an error message if applicable
+func (v *CachedSecretsManager) getByJmesPath(secretName string, raw string, jmesPath string) (string, bool, string) {
 	k := fmt.Sprintf("%s##%s", secretName, jmesPath)
 	if r, found := v.jmesPathCache[k]; found {
-		return r, true
+		return r, true, ""
 	} else {
 		var data interface{}
 		err := json.Unmarshal([]byte(raw), &data)
 		if err != nil {
-			return "", false
+			return "", false, fmt.Sprintf("failed to unmarshal JSON: %v", err)
 		}
 		r, err := jmespath.Search(jmesPath, data)
 		if err != nil {
-			return "", false
+			return "", false, fmt.Sprintf("JMESPath query failed: %v", err)
 		}
 		if r == nil {
-			return "", false
+			return "", false, "JMESPath query returned nil"
 		}
 		s := ""
 		switch r.(type) {
@@ -95,11 +98,11 @@ func (v *CachedSecretsManager) getByJmesPath(secretName string, raw string, jmes
 		default:
 			marshal, err := json.Marshal(r)
 			if err != nil {
-				return "", false
+				return "", false, fmt.Sprintf("failed to marshal result: %v", err)
 			}
 			s = string(marshal)
 		}
 		v.jmesPathCache[k] = s
-		return s, true
+		return s, true, ""
 	}
 }

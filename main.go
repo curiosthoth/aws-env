@@ -57,7 +57,7 @@ func runPipeMode(manager *internal.CachedSecretsManager, associativeArrayName st
 			continue
 		}
 		// Otherwise fetch from SecretsManager
-		actualValue, found := manager.Get(*envVar.SecretName, envVar.JMESPath)
+		actualValue, found, errMsg := manager.Get(*envVar.SecretName, envVar.JMESPath)
 		if found {
 			_, _ = fmt.Fprintf(os.Stdout, outputLineFormatter, envVar.Name, actualValue)
 			_ = os.Stdout.Sync()
@@ -67,7 +67,11 @@ func runPipeMode(manager *internal.CachedSecretsManager, associativeArrayName st
 				jmesPathStr = *envVar.JMESPath
 			}
 			if !silent {
-				_, _ = fmt.Fprintf(os.Stderr, "Error: Secret %s (path=%s) not found\n", *envVar.SecretName, jmesPathStr)
+				if errMsg != "" {
+					_, _ = fmt.Fprintf(os.Stderr, "Error: Failed to retrieve secret %s (path=%s): %s\n", *envVar.SecretName, jmesPathStr, errMsg)
+				} else {
+					_, _ = fmt.Fprintf(os.Stderr, "Error: Secret %s (path=%s) not found\n", *envVar.SecretName, jmesPathStr)
+				}
 			}
 		}
 	}
@@ -88,7 +92,7 @@ func runInitMode(manager *internal.CachedSecretsManager, args []string, silent b
 			continue
 		}
 		// Otherwise fetch and set from SecretsManager
-		actualValue, found := manager.Get(*envVar.SecretName, envVar.JMESPath)
+		actualValue, found, errMsg := manager.Get(*envVar.SecretName, envVar.JMESPath)
 		if found {
 			_ = os.Setenv(envVar.Name, actualValue)
 		} else {
@@ -97,7 +101,11 @@ func runInitMode(manager *internal.CachedSecretsManager, args []string, silent b
 				jmesPathStr = *envVar.JMESPath
 			}
 			if !silent {
-				_, _ = fmt.Fprintf(os.Stderr, "Error: Secret %s (path=%s) not found\n", *envVar.SecretName, jmesPathStr)
+				if errMsg != "" {
+					_, _ = fmt.Fprintf(os.Stderr, "Error: Failed to retrieve secret %s (path=%s): %s\n", *envVar.SecretName, jmesPathStr, errMsg)
+				} else {
+					_, _ = fmt.Fprintf(os.Stderr, "Error: Secret %s (path=%s) not found\n", *envVar.SecretName, jmesPathStr)
+				}
 			}
 		}
 	}
