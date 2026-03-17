@@ -6,18 +6,27 @@ import (
 )
 
 const (
-	SecretsManagerPrefix    = "secretsmanager://"
-	SecretsManagerPrefixLen = len(SecretsManagerPrefix)
+	DefaultDelimiter     = "##"
+	SecretsManagerScheme = "secretsmanager"
+	SecretsManagerPrefix = SecretsManagerScheme + "://"
+	SSMScheme            = "ssm"
+	SSMPrefix            = SSMScheme + "://"
 )
 
+// EnvVar describes a single environment variable and its optional remote source.
 type EnvVar struct {
 	Name       string
 	RawValue   string
-	SecretName *string // SecretName as stored in AWS SecretsManager
+	Scheme     *string
+	SecretName *string
 	JMESPath   *string
 }
 
 func (e EnvVar) String() string {
+	schemeStr := "<nil>"
+	if e.Scheme != nil {
+		schemeStr = *e.Scheme
+	}
 	secretNameStr := "<nil>"
 	if e.SecretName != nil {
 		secretNameStr = *e.SecretName
@@ -27,40 +36,55 @@ func (e EnvVar) String() string {
 		jmesPathStr = *e.JMESPath
 	}
 	return fmt.Sprintf(
-		"EnvVar{Name: %s, RawValue: %s, SecretName: %s, JMESPath: %s}",
-		e.Name, e.RawValue, secretNameStr, jmesPathStr,
+		"EnvVar{Name: %s, RawValue: %s, Scheme: %s, SecretName: %s, JMESPath: %s}",
+		e.Name, e.RawValue, schemeStr, secretNameStr, jmesPathStr,
 	)
 }
 
-// SplitEnvString does things like the following:
-// env1=val1  -> ["env1", "val1"], false
-// env2=secretsmanager://val2  -> ["env2", "val2"], true
-// env3=secretsmanager://val3##jmesPath -> ["env3", "val3", "jmesPath"], true
-func SplitEnvString(env string) (envVar EnvVar, err error) {
+// SplitEnvString parses an environment variable declaration and extracts any supported AWS-backed reference.
+func SplitEnvString(env string, delimiter string) (envVar EnvVar, err error) {
 	splitArr := strings.SplitN(env, "=", 2)
 	if len(splitArr) != 2 {
 		return envVar, fmt.Errorf("invalid env string. Need to be in the form of 'env=var'")
 	}
 	envVar.Name = splitArr[0]
 	envVar.RawValue = strings.Trim(splitArr[1], " \t\n")
+	if delimiter == "" {
+		return envVar, fmt.Errorf("invalid delimiter. Need a non-empty delimiter")
+	}
 
-	// Check if it meets the format:
-	// secretsmanager://<secret_name>...
-	if strings.Index(envVar.RawValue, SecretsManagerPrefix) != 0 {
+	switch {
+	case strings.HasPrefix(envVar.RawValue, SecretsManagerPrefix):
+		scheme := SecretsManagerScheme
+		envVar.Scheme = &scheme
+		return populateRemoteEnvVar(envVar, envVar.RawValue[len(SecretsManagerPrefix):], delimiter)
+	case strings.HasPrefix(envVar.RawValue, SSMPrefix):
+		scheme := SSMScheme
+		envVar.Scheme = &scheme
+		return populateRemoteEnvVar(envVar, envVar.RawValue[len(SSMPrefix):], delimiter)
+	default:
+		return envVar, nil
+	}
+}
+
+// populateRemoteEnvVar parses the AWS resource name and optional nested JSON key path.
+func populateRemoteEnvVar(envVar EnvVar, remoteValue string, delimiter string) (EnvVar, error) {
+	keyArr := strings.Split(remoteValue, delimiter)
+	if len(keyArr) == 0 || keyArr[0] == "" {
+		return envVar, fmt.Errorf("invalid env string. Missing remote secret or parameter name")
+	}
+	envVar.SecretName = &keyArr[0]
+	if len(keyArr) == 1 {
 		return envVar, nil
 	}
 
-	keyArr := strings.SplitN(envVar.RawValue[SecretsManagerPrefixLen:], "##", 2)
-
-	envVar.SecretName = &keyArr[0]
-	if len(keyArr) == 1 {
-		// Do nothing
-	} else if len(keyArr) == 2 {
-		// JSON
-		envVar.JMESPath = &keyArr[1]
-	} else {
-		// We do not support deeper nested keys
-		return envVar, fmt.Errorf("invalid env string. Only support one JMESPath seperated with '##'")
+	pathSegments := keyArr[1:]
+	for _, segment := range pathSegments {
+		if segment == "" {
+			return envVar, fmt.Errorf("invalid env string. JSON key path contains an empty segment")
+		}
 	}
+	jmesPath := strings.Join(pathSegments, ".")
+	envVar.JMESPath = &jmesPath
 	return envVar, nil
 }

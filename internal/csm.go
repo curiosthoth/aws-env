@@ -4,105 +4,209 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
-	"github.com/jmespath/go-jmespath"
 	"log"
+	"os"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	"github.com/jmespath/go-jmespath"
 )
 
+type secretsManagerAPI interface {
+	GetSecretValue(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
+}
+
+type ssmAPI interface {
+	GetParameter(ctx context.Context, params *ssm.GetParameterInput, optFns ...func(*ssm.Options)) (*ssm.GetParameterOutput, error)
+}
+
+var stringifyJSONResult = stringifyResult
+var loadAWSConfig = config.LoadDefaultConfig
+var fatalf = log.Fatalf
+
+// CachedSecretsManager resolves and caches values fetched from Secrets Manager and SSM.
 type CachedSecretsManager struct {
 	rawCache      map[string]string
 	jmesPathCache map[string]string
 
-	client *secretsmanager.Client
+	secretsClient secretsManagerAPI
+	ssmClient     ssmAPI
 }
 
+// NewCachedSecretsManager creates a resolver backed by the default AWS config chain.
 func NewCachedSecretsManager() *CachedSecretsManager {
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		log.Fatalf("unable to load SDK config, %v", err)
+	loadOptions := []func(*config.LoadOptions) error{config.WithRegion(defaultRegion())}
+	if accessKeyID := defaultAccessKeyID(); accessKeyID != "" {
+		loadOptions = append(loadOptions, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKeyID, defaultSecretAccessKey(), "")))
 	}
+
+	cfg, err := loadAWSConfig(context.TODO(), loadOptions...)
+	if err != nil {
+		fatalf("unable to load SDK config, %v", err)
+	}
+
+	secretsClient := secretsmanager.NewFromConfig(cfg, func(o *secretsmanager.Options) {
+		if endpoint := defaultEndpoint(); endpoint != "" {
+			o.BaseEndpoint = aws.String(endpoint)
+		}
+	})
+	ssmClient := ssm.NewFromConfig(cfg, func(o *ssm.Options) {
+		if endpoint := defaultEndpoint(); endpoint != "" {
+			o.BaseEndpoint = aws.String(endpoint)
+		}
+	})
+
+	return NewCachedSecretsManagerWithClients(secretsClient, ssmClient)
+}
+
+// NewCachedSecretsManagerWithClients creates a resolver with injected clients for tests.
+func NewCachedSecretsManagerWithClients(secretsClient secretsManagerAPI, ssmClient ssmAPI) *CachedSecretsManager {
 	return &CachedSecretsManager{
-		client:        secretsmanager.NewFromConfig(cfg),
+		secretsClient: secretsClient,
+		ssmClient:     ssmClient,
 		rawCache:      make(map[string]string),
 		jmesPathCache: make(map[string]string),
 	}
 }
 
-// Get retrieves the secret value from AWS Secrets Manager
-// The JMESPath can be nil, in which case the raw value is returned.
-// Returns the value, a boolean indicating success, and an error message if applicable
-func (v *CachedSecretsManager) Get(secretName string, jmesPath *string) (string, bool, string) {
-	raw, found, errMsg := v.getRaw(secretName)
-	if found {
-		if jmesPath != nil {
-			return v.getByJmesPath(secretName, raw, *jmesPath)
-		} else {
-			return raw, true, ""
-		}
-	} else {
+// Get retrieves the remote value and optionally extracts a nested JSON key.
+func (v *CachedSecretsManager) Get(scheme string, secretName string, jmesPath *string) (string, bool, string) {
+	raw, found, errMsg := v.getRaw(scheme, secretName)
+	if !found {
 		return "", false, errMsg
 	}
+	if jmesPath == nil {
+		return raw, true, ""
+	}
+	return v.getByJmesPath(cacheKey(scheme, secretName), raw, *jmesPath)
 }
 
-// getRaw retrieves the secret value from AWS Secrets Manager and cache it locally as is
-// Returns the value, a boolean indicating success, and an error message if applicable
-func (v *CachedSecretsManager) getRaw(secretName string) (string, bool, string) {
-	if r, found := v.rawCache[secretName]; found {
+// getRaw retrieves the source value and caches it by backend and key.
+func (v *CachedSecretsManager) getRaw(scheme string, secretName string) (string, bool, string) {
+	k := cacheKey(scheme, secretName)
+	if r, found := v.rawCache[k]; found {
 		return r, true, ""
 	}
-	input := &secretsmanager.GetSecretValueInput{
-		SecretId: &secretName,
+
+	var (
+		r   string
+		err error
+	)
+	switch scheme {
+	case SecretsManagerScheme:
+		r, err = v.getSecretRaw(secretName)
+	case SSMScheme:
+		r, err = v.getParameterRaw(secretName)
+	default:
+		return "", false, fmt.Sprintf("unsupported scheme: %s", scheme)
 	}
-	result, err := v.client.GetSecretValue(context.TODO(), input)
 	if err != nil {
 		return "", false, err.Error()
 	}
-	r := *result.SecretString
-	v.rawCache[secretName] = r
+
+	v.rawCache[k] = r
 	return r, true, ""
 }
 
-// getByJmesPath retrieves the secret value from AWS Secrets Manager and cache it locally
-// Returns the value, a boolean indicating success, and an error message if applicable
-func (v *CachedSecretsManager) getByJmesPath(secretName string, raw string, jmesPath string) (string, bool, string) {
-	k := fmt.Sprintf("%s##%s", secretName, jmesPath)
+// getSecretRaw loads a secret string from AWS Secrets Manager.
+func (v *CachedSecretsManager) getSecretRaw(secretName string) (string, error) {
+	result, err := v.secretsClient.GetSecretValue(context.TODO(), &secretsmanager.GetSecretValueInput{
+		SecretId: &secretName,
+	})
+	if err != nil {
+		return "", err
+	}
+	if result.SecretString == nil {
+		return "", fmt.Errorf("secret has no string value")
+	}
+	return *result.SecretString, nil
+}
+
+// getParameterRaw loads a decrypted parameter value from AWS SSM Parameter Store.
+func (v *CachedSecretsManager) getParameterRaw(parameterName string) (string, error) {
+	result, err := v.ssmClient.GetParameter(context.TODO(), &ssm.GetParameterInput{
+		Name:           &parameterName,
+		WithDecryption: aws.Bool(true),
+	})
+	if err != nil {
+		return "", err
+	}
+	if result.Parameter == nil || result.Parameter.Value == nil {
+		return "", fmt.Errorf("parameter has no value")
+	}
+	return *result.Parameter.Value, nil
+}
+
+// getByJmesPath extracts and caches a JSON value resolved from a raw source string.
+func (v *CachedSecretsManager) getByJmesPath(cachePrefix string, raw string, jmesPath string) (string, bool, string) {
+	k := fmt.Sprintf("%s%s%s", cachePrefix, DefaultDelimiter, jmesPath)
 	if r, found := v.jmesPathCache[k]; found {
 		return r, true, ""
-	} else {
-		var data interface{}
-		err := json.Unmarshal([]byte(raw), &data)
-		if err != nil {
-			return "", false, fmt.Sprintf("failed to unmarshal JSON: %v", err)
-		}
-		r, err := jmespath.Search(jmesPath, data)
-		if err != nil {
-			return "", false, fmt.Sprintf("JMESPath query failed: %v", err)
-		}
-		if r == nil {
-			return "", false, "JMESPath query returned nil"
-		}
-		s := ""
-		switch r.(type) {
-		case string:
-			// Do nothing
-			s = r.(string)
-		case float64:
-			if r.(float64) == float64(int64(r.(float64))) {
-				s = fmt.Sprintf("%d", int64(r.(float64)))
-			} else {
-				s = fmt.Sprintf("%f", r.(float64))
-			}
-		case bool:
-			s = fmt.Sprintf("%t", r.(bool))
-		default:
-			marshal, err := json.Marshal(r)
-			if err != nil {
-				return "", false, fmt.Sprintf("failed to marshal result: %v", err)
-			}
-			s = string(marshal)
-		}
-		v.jmesPathCache[k] = s
-		return s, true, ""
 	}
+
+	var data interface{}
+	err := json.Unmarshal([]byte(raw), &data)
+	if err != nil {
+		return "", false, fmt.Sprintf("failed to unmarshal JSON: %v", err)
+	}
+	r, err := jmespath.Search(jmesPath, data)
+	if err != nil {
+		return "", false, fmt.Sprintf("JMESPath query failed: %v", err)
+	}
+	if r == nil {
+		return "", false, "JMESPath query returned nil"
+	}
+
+	s, err := stringifyJSONResult(r)
+	if err != nil {
+		return "", false, fmt.Sprintf("failed to format result: %v", err)
+	}
+	v.jmesPathCache[k] = s
+	return s, true, ""
+}
+
+func cacheKey(scheme string, name string) string {
+	return fmt.Sprintf("%s://%s", scheme, name)
+}
+
+func stringifyResult(v interface{}) (string, error) {
+	switch typed := v.(type) {
+	case string:
+		return typed, nil
+	case float64:
+		if typed == float64(int64(typed)) {
+			return fmt.Sprintf("%d", int64(typed)), nil
+		}
+		return fmt.Sprintf("%f", typed), nil
+	case bool:
+		return fmt.Sprintf("%t", typed), nil
+	default:
+		marshal, err := json.Marshal(typed)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal result: %v", err)
+		}
+		return string(marshal), nil
+	}
+}
+
+func defaultEndpoint() string {
+	return os.Getenv("AWS_ENDPOINT_URL")
+}
+
+func defaultRegion() string {
+	if region := os.Getenv("AWS_REGION"); region != "" {
+		return region
+	}
+	return "us-east-1"
+}
+
+func defaultAccessKeyID() string {
+	return os.Getenv("AWS_ACCESS_KEY_ID")
+}
+
+func defaultSecretAccessKey() string {
+	return os.Getenv("AWS_SECRET_ACCESS_KEY")
 }
